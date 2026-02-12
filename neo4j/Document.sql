@@ -1,0 +1,16 @@
+{
+    id, 
+    url, 
+    domain, 
+    title, 
+    author, 
+    effective_date, 
+    published_date, 
+    retrieved_at, 
+    subjects[],
+    language, 
+    canonical_url,
+    hash, 
+    raw_html?, 
+    text
+}

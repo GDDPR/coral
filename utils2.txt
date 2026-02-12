@@ -1,0 +1,479 @@
+def reset_database():
+    #this is useful to start fresh, if not the node duplicate and ... it gets funny;  would not be for real.
+    with driver.session() as session:
+        try:
+            session.run("MATCH (n) DETACH DELETE n")
+            st.success("Database reset successfully!")
+        except Exception as e:
+            st.error(f"Failed to reset database: {e}")
+
+def create_vector_indexes():
+    #this will be different for you but just an example
+    cypher_commands = [
+        """
+        CREATE VECTOR INDEX tagEmbeddingIndex IF NOT EXISTS
+        FOR (t:Tag) ON (t.embedding)
+        OPTIONS {
+          indexConfig: {
+            `vector.dimensions`: 768,
+            `vector.similarity_function`: 'cosine'
+          }
+        };
+        """,
+        """
+        CREATE VECTOR INDEX taskEmbeddingIndex IF NOT EXISTS
+        FOR (t:Task) ON (t.embedding)
+        OPTIONS {
+          indexConfig: {
+            `vector.dimensions`: 768,
+            `vector.similarity_function`: 'cosine'
+          }
+        };
+        """,
+        """
+        CREATE VECTOR INDEX jobTitleEmbeddingIndex IF NOT EXISTS
+        FOR (p:Person) ON (p.job_title_embedding)
+        OPTIONS {
+          indexConfig: {
+            `vector.dimensions`: 768,
+            `vector.similarity_function`: 'cosine'
+          }
+        };
+        """
+    ]
+
+    try:
+        with driver.session() as session:
+            for cmd in cypher_commands:
+                session.run(cmd)
+        st.success("Vector indexes created successfully!")
+    except Exception as e:
+        st.error(f"Failed to create vector indexes: {e}")
+
+
+
+def extract_keywords_llm(query):
+    prompt = f"""
+Extract the core technical keywords and skills from the following project description:
+
+"{query}"
+
+Return ONLY a JSON list of keywords or short phrases.
+Do not add commentary or explanation.
+
+Examples:
+Input: "Need someone to improve Active Directory security"
+Output: ["active directory", "security", "identity", "access control"]
+
+Input: "A project to move workloads to Kubernetes"
+Output: ["kubernetes", "containers", "cloud", "orchestration"]
+
+Now process the user's query.
+"""
+    payload = {
+        "model": OLLAMA_SUMMARY_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+
+    resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=200)
+    out = resp.json()
+    text = out.get("response", "").strip()
+
+    try:
+        keywords = json.loads(text)
+        if isinstance(keywords, list):
+            return [k.lower() for k in keywords]
+    except:
+        pass
+
+    # Fallback to simple extractor
+    return extract_keywords(query)
+
+
+--------------------------------------
+
+import re
+
+STOPWORDS = {
+    "who", "what", "where", "when", "why", "how",
+    "is", "are", "was", "were", "be", "been", "being",
+    "the", "a", "an", "of", "in", "to", "for", "on", "with",
+    "and", "or", "that", "this", "these", "those", "by",
+    "do", "does", "did", "which", "whom", "whose", "as",
+    "i", "you", "he", "she", "it", "we", "they", "them",
+    "point", "contact", "responsible", "charge", "person"
+}
+
+def extract_keywords(text):
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    words = [w for w in text.split() if w not in STOPWORDS]
+    return words
+
+def extract_phrases(words):
+    phrases = []
+    for i in range(len(words) - 1):
+        phrases.append(f"{words[i]} {words[i+1]}")
+    return phrases
+
+import math
+
+def bm25_score(text, keywords):
+    text_words = text.lower().split()
+    score = 0
+    for kw in keywords:
+        freq = text_words.count(kw)
+        if freq > 0:
+            score += (freq / (freq + 0.5)) * math.log(1.5)
+    return score
+
+
+--------------------------------
+def get_embedding(text: str):
+    if not text or not text.strip():
+        return [0.0] * VECTOR_DIM
+
+    payload = {
+        "model": OLLAMA_EMBED_MODEL,
+        "prompt": text,
+        "stream": False
+    }
+
+    resp = requests.post(f"{OLLAMA_URL}/api/embeddings", json=payload)
+    out = resp.json()
+
+    # DEBUG
+    # st.write(out)
+
+    # New Ollama format
+    if "data" in out:
+        emb = out["data"][0]["embedding"]
+    else:
+        emb = out.get("embedding", [])
+
+    # Extra safety
+    if len(emb) != VECTOR_DIM:
+        st.error(f"Embedding dimension mismatch: {len(emb)} expected {VECTOR_DIM}")
+        return [0.0] * VECTOR_DIM
+
+    return emb
+
+
+
+# -------------------------------------------------------
+# LLM SUMMARIZER (stream=false)
+# -------------------------------------------------------
+def summarize_person(person):
+
+    # Normalize everything to safe types
+    manager = person.get("manager") or ""
+    job_title = person.get("job_title") or ""
+    email = person.get("email") or ""
+    telephone = person.get("telephone") or ""
+
+    tasks = person.get("tasks") or []
+    if tasks is None:
+        tasks = []
+    tasks_str = ", ".join(tasks)
+
+    tags = person.get("tags") or []
+    if tags is None:
+        tags = []
+    tags_str = ", ".join(tags)
+
+    name = person.get("name") or ""
+
+    prompt = f"""
+Summarize this employee in 4–5 bullet points:
+
+Name: {name}
+Job title: {job_title}
+Email: {email}
+Telephone: {telephone}
+Tasks: {tasks_str}
+Skills: {tags_str}
+Reports to: {manager}
+"""
+
+    payload = {
+        "model": OLLAMA_SUMMARY_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+
+    resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=250)
+    out = resp.json()
+
+    return out.get("response", "")
+
+
+
+------------------------------
+
+# -------------------------------------------------------
+# INSERT PERSON (CSV → Neo4j)
+# -------------------------------------------------------
+def insert_person(tx, row):
+    # Normalize row keys and values
+    row = {
+        k.strip().lower(): (v.strip() if isinstance(v, str) else v)
+        for k, v in row.items()
+    }
+
+    name = row.get("name", "")
+    email = row.get("email", "").lower()
+    tel = row.get("telephone", "")
+    job_title = row.get("job_title", "")
+    reports_to = row.get("reports_to", "").lower()
+    tasks = [t.strip() for t in row.get("tasks", "").split(",") if t.strip()]
+    tags = [t.strip() for t in row.get("tags", "").split(",") if t.strip()]
+
+    # Pass 1: Create Person node with full details
+    job_vec = get_embedding(job_title)
+    tx.run("""
+        MERGE (p:Person {email:$email})
+        ON CREATE SET p.name=$name, p.telephone=$tel, p.job_title=$job_title, p.job_title_embedding=$job_vec
+        ON MATCH SET p.name=$name, p.telephone=$tel, p.job_title=$job_title, p.job_title_embedding=$job_vec
+    """, name=name, email=email, tel=tel, job_title=job_title, job_vec=job_vec)
+
+    # Pass 2: Relationships will be handled separately (reports_to pass later)
+
+    # Pass 3: Tasks and Tags
+    for task in tasks:
+       
+        vec = get_embedding(task)
+        # DEBUG
+        #st.write(f"Task: {task}")
+        #st.write(f"Embedding length: {len(vec)}")
+        #st.write(f"First 5 values: {vec[:5]}")
+
+        tx.run("""
+            MERGE (t:Task {name:$task})
+            ON CREATE SET t.embedding=$vec
+            WITH t
+            MATCH (p:Person {email:$email})
+            MERGE (p)-[:RESPONSIBLE_FOR]->(t)
+        """, email=email, task=task, vec=vec)
+
+    for tag in tags:
+        vec = get_embedding(tag)
+        tx.run("""
+            MERGE (tg:Tag {name:$tag})
+            ON CREATE SET tg.embedding=$vec
+            WITH tg
+            MATCH (p:Person {email:$email})
+            MERGE (p)-[:HAS_TAG]->(tg)
+        """, email=email, tag=tag, vec=vec)
+
+
+def create_reports_to(tx, email, manager_email):
+    tx.run("""
+        MATCH (p:Person {email:$email})
+        MATCH (m:Person {email:$manager})
+        MERGE (p)-[:REPORTS_TO]->(m)
+    """, email=email, manager=manager_email)
+
+# -------------------------------------------------------
+# NEO4J QUERIES
+# -------------------------------------------------------
+def get_all_people(session):
+    return session.run("""
+        MATCH (p:Person)
+        RETURN p
+        ORDER BY p.name
+    """).data()
+
+
+def get_person_details(session, email):
+    return session.run("""
+        MATCH (p:Person {email:$email})
+        OPTIONAL MATCH (p)-[:RESPONSIBLE_FOR]->(t:Task)
+        OPTIONAL MATCH (p)-[:HAS_TAG]->(tg:Tag)
+        OPTIONAL MATCH (p)-[:REPORTS_TO]->(m:Person)
+        RETURN p,
+               collect(DISTINCT t.name) AS tasks,
+               collect(DISTINCT tg.name) AS tags,
+               m.name AS manager
+    """, email=email).single()
+
+
+def get_reports_to_chain(session, email):
+    return session.run("""
+        MATCH path = (p:Person {email:$email})-[:REPORTS_TO*0..8]->(m:Person)
+        WITH nodes(path) AS ns
+        RETURN [n IN ns | n.name] AS chain
+    """, email=email).data()
+
+
+def query_vector_index(session, index_name, embedding, topk):
+    return session.run("""
+        CALL db.index.vector.queryNodes(
+          $index, $topk, $embedding
+        ) YIELD node, score
+        RETURN node, score
+    """, index=index_name, topk=topk, embedding=embedding).data()
+
+----------------------------------
+
+# -------------------------------------------------------
+# HYBRID SEARCH TAB (Semantic + Keyword Boost)
+# -------------------------------------------------------
+with tabs[3]:
+    st.header("🔀 Hybrid Search (Semantic + Keyword Boost)")
+    with st.expander("ℹ️ About This Tab"):
+        st.write("""
+    This tab provides a blended approach to finding people based on both semantic meaning and literal keyword matches.
+
+    Hybrid search is ideal when you have a concept in mind—such as “cloud”, “security”, “project management”, or “python”—and want to find individuals whose job titles, skills, or responsibilities align with that idea.
+
+    ---
+
+    ### 🔍 How the search works
+    Hybrid search combines two complementary methods:
+
+    #### **1. Semantic Search (Vector-Based)**
+    Your query is converted into an embedding using your local LLM.
+    That vector is compared against three Neo4j vector indexes:
+
+    - Job title embeddings  
+    - Task embeddings  
+    - Skill/Tag embeddings  
+
+    This surfaces people whose profile is **conceptually similar** to your query—even if the exact keyword doesn’t appear.
+
+    #### **2. Keyword Boost**
+    If the exact keyword appears in:
+    - Their job title (strongest signal)  
+    - Their tasks  
+    - Their tags (skills)  
+
+    They receive a numeric boost to their score.
+
+    This ensures obvious keyword matches don’t get overshadowed by purely semantic similarity.
+
+    ---
+
+    ### 🎯 What this is useful for
+    Hybrid search is especially helpful when you want to:
+
+    - Find subject-matter experts  
+    - Identify people with adjacent or related skills  
+    - Explore capabilities across teams  
+    - Discover hidden expertise that might not match exact words  
+    - Support staffing decisions, triage, or ad-hoc team formation  
+
+    It balances **precision (keyword)** and **insight (semantic)** to give a more accurate results list.
+
+    ---
+
+    ### 📊 Result Ranking
+    Each person is displayed with:
+
+    - **Semantic Score** — similarity of embeddings  
+    - **Keyword Boost** — additions based on keyword presence  
+    - **Final Score** — the combined ranking metric  
+
+    Higher scores indicate stronger alignment with your query.
+
+    ---
+
+    ### 💡 Tip
+    This tab is perfect when your query is a **single skill term or keyword**.
+    For multi-sentence project descriptions, the **Hybrid Team Builder** does deeper LLM-based keyword extraction and hybrid scoring.
+
+    """)
+
+    query = st.text_input("Enter a skill, keyword, or concept:")
+    topk = st.slider("Top K (semantic candidates)", 3, 30, 10)
+
+    if st.button("Run Hybrid Search"):
+        keyword = query.strip().lower()
+
+        # 1. EMBEDDING for semantic similarity
+        emb = get_embedding(query)
+
+        with driver.session() as session:
+            # Semantic hits from three indexes
+            tag_hits = query_vector_index(session, "tagEmbeddingIndex", emb, topk)
+            task_hits = query_vector_index(session, "taskEmbeddingIndex", emb, topk)
+            title_hits = query_vector_index(session, "jobTitleEmbeddingIndex", emb, topk)
+
+            # FETCH ALL PEOPLE WITH TAGS + TASKS + JOB TITLE
+            people = session.run("""
+                MATCH (p:Person)
+                OPTIONAL MATCH (p)-[:HAS_TAG]->(tg:Tag)
+                OPTIONAL MATCH (p)-[:RESPONSIBLE_FOR]->(t:Task)
+                RETURN p.email AS email,
+                       p.name AS name,
+                       p.job_title AS job_title,
+                       collect(DISTINCT tg.name) AS tags,
+                       collect(DISTINCT t.name) AS tasks
+            """).data()
+
+        # 2. Build semantic score lookup
+        semantic_scores = {}
+
+        def add_scores(hits):
+            for h in hits:
+                node = h["node"]
+                score = h["score"]
+                # node could be Tag, Task or Person
+                for key in ["email", "name"]:
+                    if key in node:
+                        eid = node[key]
+                        semantic_scores[eid] = max(semantic_scores.get(eid, 0), score)
+
+        add_scores(tag_hits)
+        add_scores(task_hits)
+        add_scores(title_hits)
+
+        # 3. Compute hybrid scores
+        ranked = []
+        for p in people:
+            email = p["email"]
+            base = semantic_scores.get(email, 0.0)
+
+            boost = 0.0
+
+            # JOB TITLE (strongest signal)
+            if keyword in (p["job_title"] or "").lower():
+                boost += 0.45
+
+            # TASKS
+            for task in p["tasks"]:
+                if keyword in task.lower():
+                    boost += 0.30
+                    break
+
+            # TAGS
+            for tag in p["tags"]:
+                if keyword in tag.lower():
+                    boost += 0.20
+                    break
+
+            ranked.append({
+                "name": p["name"],
+                "email": p["email"],
+                "job_title": p["job_title"],
+                "tags": p["tags"],
+                "tasks": p["tasks"],
+                "semantic_score": base,
+                "boost": boost,
+                "final_score": base + boost
+            })
+
+        # 4. Sort by final score
+        ranked = sorted(ranked, key=lambda r: r["final_score"], reverse=True)
+
+        st.subheader("🔀 Hybrid Results (Semantic + Keyword Boost)")
+        for r in ranked[:topk]:
+            st.markdown(f"""
+            ### {r['name']} — {r['job_title']}
+            **Email:** {r['email']}  
+            **Semantic Score:** {r['semantic_score']:.3f}  
+            **Keyword Boost:** {r['boost']:.3f}  
+            **Final Score:** `{r['final_score']:.3f}`  
+            **Tags:** {", ".join(r['tags'])}  
+            **Tasks:** {", ".join(r['tasks'])}  
+            """)

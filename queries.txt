@@ -1,0 +1,45 @@
+// Indexes and constraints
+
+CREATE CONSTRAINT docid IF NOT EXISTS
+FOR (d:Document) REQUIRE d.id IS UNIQUE;
+
+CREATE CONSTRAINT chunkid IF NOT EXISTS
+FOR (c:Chunk) REQUIRE c.id IS UNIQUE;
+
+CREATE CONSTRAINT entid IF NOT EXISTS
+FOR (e:Entity) REQUIRE e.id IS UNIQUE;
+
+CREATE CONSTRAINT qaid IF NOT EXISTS
+FOR (q:QAPair) REQUIRE q.id IS UNIQUE;
+
+CREATE CONSTRAINT tblid IF NOT EXISTS
+FOR (t:TableImage) REQUIRE t.id IS UNIQUE;
+
+
+CREATE FULLTEXT INDEX fulltextcontent IF NOT EXISTS
+FOR (n:Document|Chunk|QAPair)
+ON EACH [n.title, n.text, n.question, n.answer];
+
+CREATE VECTOR INDEX chunkembedding IF NOT EXISTS
+FOR (c:Chunk) ON (c.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 768,
+    `vector.similarity_function`: 'cosine'
+  }
+};
+
+CREATE VECTOR INDEX qaembedding IF NOT EXISTS
+FOR (q:QAPair) ON (q.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 768,
+    `vector.similarity_function`: 'cosine'
+  }
+};
+
+
+
+
+
+

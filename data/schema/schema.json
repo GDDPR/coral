@@ -1,0 +1,28 @@
+{
+	"id": "uuid",
+	"url": "https://example.com/policy",
+	"domain": "www.canada.ca",
+	"title": "Policy X",
+	"author": "Dept Y",
+	"effectivedate": "2024-11-15",
+	"publisheddate": "2024-12-01",
+	"sections": [ 
+		{
+			"title": "title1",
+			"text": "text"
+		}
+	],
+	"rawhtml": null,
+	"retrievedat": "2026-01-20T13:20:00Z",
+	"language": "en", 
+	"subjects": [
+    "Introduction",
+    "Definitions",
+    "Overview",
+    "Consequences",
+    "Responsibilities",
+    "References"
+  ],
+	"canonical_url": "http:.....",
+  "hash": "61f4d0f3bb5c278685a4f8797fa4089329d66ce45a4a4f4afcf07a131ec95e53"
+}
