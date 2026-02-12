@@ -1,16 +1,17 @@
-# src/extraction/extract_entities.py
 import json
 import os
 import re
 import hashlib
+import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 from neo4j import GraphDatabase
 
 
-# ===== Config (your env var style) =====
+# ===== Config (env vars) =====
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemma3:12b")
 
@@ -18,14 +19,20 @@ NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD")
 
-FETCH_LIMIT = int(os.environ.get("FETCH_LIMIT", "30"))      # how many chunks to pull per loop
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))         # how many chunks to send to LLM per loop (small!)
-TIMEOUT_S = int(os.environ.get("OLLAMA_TIMEOUT", "180"))
+FETCH_LIMIT = int(os.environ.get("FETCH_LIMIT", "50"))      # chunks fetched per loop from Neo4j
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))         # LLM calls per loop
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "180"))
 
-# extraction “done” marker on Chunk:
+# local progress log (successful chunks)
+PROGRESS_LOG = Path(os.environ.get("PHASE3_PROGRESS_LOG", "data/phase3a_done.jsonl"))
+
+# marker fields on Chunk
 DONE_FIELD = "extracted_at"
+MODEL_FIELD = "extract_model"
+SIG_FIELD = "significance"
 
 
+# ===== Helpers =====
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -34,30 +41,35 @@ def sha16(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+def clean_ws(x: Any) -> str:
+    return re.sub(r"\s+", " ", str(x or "")).strip()
 
 
-def normalize_entity_type(t: str) -> str:
+def normalize_entity_type(t: Any) -> str:
     t = clean_ws(t)
     if not t:
         return "Concept"
-    # Keep simple & consistent
-    t_low = t.lower()
-    if t_low in {"person", "people"}:
+    tl = t.lower()
+    if tl in {"person", "people"}:
         return "Person"
-    if t_low in {"org", "organization", "organisation"}:
+    if tl in {"org", "organization", "organisation"}:
         return "Organization"
-    if t_low in {"location", "place"}:
+    if tl in {"location", "place"}:
         return "Location"
-    if t_low in {"date", "time"}:
+    if tl in {"date", "time"}:
         return "Date"
+    if tl in {"concept"}:
+        return "Concept"
     return t[0].upper() + t[1:]
+
+
+def coerce_list(x: Any) -> List[Any]:
+    return x if isinstance(x, list) else []
 
 
 def extract_json_object(text: str) -> Optional[dict]:
     """
-    Pull strict JSON out of model output.
+    Pull a JSON object out of LLM output.
     Handles:
       - pure JSON
       - ```json ... ```
@@ -85,7 +97,7 @@ def extract_json_object(text: str) -> Optional[dict]:
 
 
 def build_prompt(chunk_text: str) -> str:
-    # You asked for the exact template style. Keep it strict.
+    # Your strict JSON template
     return f"""SYSTEM: You are an information extraction assistant. Return strict JSON only.
 
 USER: Given the text below, extract:
@@ -108,9 +120,6 @@ Return:
 
 
 def ollama_generate(prompt: str) -> str:
-    """
-    Ollama generate API (works for Gemma).
-    """
     resp = requests.post(
         f"{OLLAMA_HOST}/api/generate",
         json={
@@ -119,22 +128,195 @@ def ollama_generate(prompt: str) -> str:
             "stream": False,
             "options": {"temperature": 0.0},
         },
-        timeout=TIMEOUT_S,
+        timeout=OLLAMA_TIMEOUT,
     )
     resp.raise_for_status()
     data = resp.json()
     return data.get("response", "")
 
 
-def coerce_list(x: Any) -> List[Any]:
-    return x if isinstance(x, list) else []
+def log_error(msg: str) -> None:
+    print(f"[ERROR] {msg}", flush=True)
+
+
+def log_info(msg: str) -> None:
+    print(f"[INFO] {msg}", flush=True)
+
+
+def ensure_progress_log_parent() -> None:
+    PROGRESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_done_chunk_ids() -> Set[str]:
+    """
+    Reads data/phase3a_done.jsonl and returns chunk ids already completed.
+    Each line is JSON like: {"chunk_id":"...", "doc_id":"...", "done_at":"..."}
+    """
+    done: Set[str] = set()
+    if not PROGRESS_LOG.exists():
+        return done
+
+    try:
+        with PROGRESS_LOG.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    cid = obj.get("chunk_id")
+                    if isinstance(cid, str) and cid:
+                        done.add(cid)
+                except Exception:
+                    # ignore corrupted line, keep going
+                    continue
+    except Exception as e:
+        log_error(f"Could not read progress log {PROGRESS_LOG}: {type(e).__name__}: {e}")
+
+    return done
+
+
+def append_done_chunk(doc_id: str, chunk_id: str) -> None:
+    """
+    Append a successful chunk to progress log (JSONL).
+    """
+    ensure_progress_log_parent()
+    rec = {"doc_id": doc_id, "chunk_id": chunk_id, "done_at": now_iso(), "model": LLM_MODEL}
+    with PROGRESS_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# ===== Build extraction payload for one chunk =====
+def build_entities_payload(doc_id: str, entities_in: List[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for e in entities_in:
+        if not isinstance(e, dict):
+            continue
+        name = clean_ws(e.get("name"))
+        if not name:
+            continue
+        etype = normalize_entity_type(e.get("type"))
+        aliases = e.get("aliases")
+        if not isinstance(aliases, list):
+            aliases = []
+        aliases = [clean_ws(a) for a in aliases if clean_ws(a)]
+        ent_id = sha16(f"{doc_id}|{etype}|{name.lower()}")
+        evidence = clean_ws(e.get("evidence_excerpt"))
+        out.append(
+            {
+                "id": ent_id,
+                "name": name,
+                "type": etype,
+                "aliases": aliases,
+                "evidence_excerpt": evidence,
+            }
+        )
+    return out
+
+
+def build_dates_payload(doc_id: str, dates_in: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Dates cannot be stored as list-of-maps property in Neo4j.
+    We store them as Entity nodes with type='Date' and link via MENTIONS_DATE.
+    """
+    out: List[Dict[str, Any]] = []
+    for d in dates_in:
+        if not isinstance(d, dict):
+            continue
+        label = clean_ws(d.get("label"))
+        value = clean_ws(d.get("value"))
+        certainty = clean_ws(d.get("certainty"))
+        if not value:
+            continue
+        date_ent_id = sha16(f"{doc_id}|Date|{value.lower()}")
+        out.append({"id": date_ent_id, "value": value, "label": label, "certainty": certainty})
+    return out
+
+
+def build_rels_payload(doc_id: str, rels_in: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Relationships reference source_entity and target_entity names.
+    We map those names to deterministic ids using same rule as entities.
+    If model doesn't provide types, default to Concept.
+    """
+    out: List[Dict[str, Any]] = []
+
+    def ent_id_for(name: str, typ: Any) -> str:
+        return sha16(f"{doc_id}|{normalize_entity_type(typ)}|{name.lower()}")
+
+    for r in rels_in:
+        if not isinstance(r, dict):
+            continue
+        s = clean_ws(r.get("source_entity"))
+        t = clean_ws(r.get("target_entity"))
+        rel_type = clean_ws(r.get("relation_type")) or "RELATED_TO"
+        evidence = clean_ws(r.get("evidence_excerpt"))
+        if not s or not t:
+            continue
+        s_type = r.get("source_type") or "Concept"
+        t_type = r.get("target_type") or "Concept"
+        out.append(
+            {
+                "source_id": ent_id_for(s, s_type),
+                "target_id": ent_id_for(t, t_type),
+                "relation_type": rel_type,
+                "evidence_excerpt": evidence,
+            }
+        )
+    return out
+
+
+# ===== Neo4j write (single-chunk atomic write) =====
+WRITE_ONE_CHUNK_Q = f"""
+// One chunk, one transaction, atomic "done" marker
+MATCH (d:Document {{id: $doc_id}})
+MATCH (c:Chunk {{id: $chunk_id}})
+
+SET c.{SIG_FIELD} = $significance,
+    c.{MODEL_FIELD} = $model,
+    c.{DONE_FIELD} = $extracted_at
+
+WITH d, c
+
+// ---- Non-date entities ----
+UNWIND $entities AS ent
+MERGE (e:Entity {{id: ent.id}})
+SET e.name = ent.name,
+    e.type = ent.type,
+    e.aliases = ent.aliases,
+    e.source_doc_id = d.id
+MERGE (c)-[m:MENTIONS]->(e)
+SET m.evidence_excerpt = ent.evidence_excerpt
+
+WITH d, c
+
+// ---- Date entities ----
+UNWIND $dates AS dt
+MERGE (de:Entity {{id: dt.id}})
+SET de.name = dt.value,
+    de.type = 'Date',
+    de.aliases = [],
+    de.source_doc_id = d.id
+MERGE (c)-[md:MENTIONS_DATE]->(de)
+SET md.label = coalesce(dt.label,''),
+    md.certainty = coalesce(dt.certainty,'')
+
+WITH d, c
+
+// ---- Relationships ----
+UNWIND $rels AS r
+MATCH (e1:Entity {{id: r.source_id}})
+MATCH (e2:Entity {{id: r.target_id}})
+MERGE (e1)-[x:RELATED_TO {{relation_type: r.relation_type}}]->(e2)
+SET x.evidence_excerpt = r.evidence_excerpt
+"""
 
 
 def main() -> None:
     if not NEO4J_PASSWORD:
         raise RuntimeError("Missing NEO4J_PASSWORD (export it first).")
 
-    # Quick Ollama check (fails fast if Ollama is down)
+    # Ollama quick check
     try:
         r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
         r.raise_for_status()
@@ -144,10 +326,14 @@ def main() -> None:
             f"Original error: {type(e).__name__}: {e}"
         )
 
+    done_local = load_done_chunk_ids()
+    log_info(f"Progress log: {PROGRESS_LOG} (done chunks loaded: {len(done_local)})")
+
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     driver.verify_connectivity()
 
-    # Fetch chunks not yet extracted (works with your Document->Section->Chunk graph)
+    # Fetch chunks not yet extracted from Neo4j.
+    # We ALSO locally skip any that are in the progress log.
     fetch_q = f"""
     MATCH (d:Document)-[:HAS_SECTION]->(:Section)-[:CONTAINS]->(c:Chunk)
     WHERE c.{DONE_FIELD} IS NULL
@@ -155,189 +341,140 @@ def main() -> None:
     LIMIT $limit
     """
 
-    # Upsert Entities + connect Chunk->Entity + store chunk significance
-    # Your Entity schema: {id, name, type, aliases[], source_doc_id}
-    write_entities_q = f"""
-    UNWIND $rows AS row
-    MATCH (d:Document {{id: row.doc_id}})
-    MATCH (c:Chunk {{id: row.chunk_id}})
-
-    SET c.significance = row.significance,
-        c.{DONE_FIELD} = $extracted_at,
-        c.extract_model = $model
-
-    WITH d, c, row
-    UNWIND row.entities AS ent
-        MERGE (e:Entity {{id: ent.id}})
-        SET e.name = ent.name,
-            e.type = ent.type,
-            e.aliases = ent.aliases,
-            e.source_doc_id = row.doc_id
-        MERGE (c)-[m:MENTIONS]->(e)
-        SET m.evidence_excerpt = ent.evidence_excerpt
-    """
-
-    # Optional: store relationships between entities
-    # We keep a single relationship type and put the relation string in a property
-    write_rels_q = """
-    UNWIND $rels AS r
-    MATCH (e1:Entity {id: r.source_id})
-    MATCH (e2:Entity {id: r.target_id})
-    MERGE (e1)-[x:RELATED_TO {relation_type: r.relation_type}]->(e2)
-    SET x.evidence_excerpt = r.evidence_excerpt
-    """
-
-    # Optional: store extracted dates on the chunk (simple & avoids extra node type)
-    write_dates_q = """
-    UNWIND $dates AS drow
-    MATCH (c:Chunk {id: drow.chunk_id})
-    SET c.extracted_dates = drow.dates
-    """
-
-    total = 0
+    total_ok = 0
+    total_skipped_local = 0
+    total_llm_fail = 0
+    total_bad_json = 0
+    total_write_fail = 0
 
     while True:
-        records, _, _ = driver.execute_query(fetch_q, limit=FETCH_LIMIT)
+        try:
+            records, _, _ = driver.execute_query(fetch_q, limit=FETCH_LIMIT)
+        except Exception as e:
+            log_error(f"Neo4j fetch failed: {type(e).__name__}: {e}")
+            log_error(traceback.format_exc())
+            break
+
         if not records:
             break
 
-        # Make small LLM batches
-        # records is list-like; convert to python list
         recs = list(records)
 
-        rows_to_write: List[Dict[str, Any]] = []
-        rels_to_write: List[Dict[str, Any]] = []
-        dates_to_write: List[Dict[str, Any]] = []
+        # local-skip filter
+        filtered: List[Tuple[str, str, str]] = []
+        for rec in recs:
+            doc_id = rec["doc_id"]
+            chunk_id = rec["chunk_id"]
+            text = rec["text"] or ""
+            if chunk_id in done_local:
+                total_skipped_local += 1
+                continue
+            filtered.append((doc_id, chunk_id, text))
 
-        # Process in small groups to avoid long stalls
-        for start in range(0, len(recs), BATCH_SIZE):
-            group = recs[start : start + BATCH_SIZE]
+        if not filtered:
+            # If everything fetched was already done locally, continue fetching next page/loop.
+            log_info(f"Fetched {len(recs)} chunks, but all were already in progress log; continuing...")
+            continue
 
-            for rec in group:
-                doc_id = rec["doc_id"]
-                chunk_id = rec["chunk_id"]
-                chunk_text = clean_ws(rec["text"])
+        # Process in small batches (LLM calls)
+        for start in range(0, len(filtered), BATCH_SIZE):
+            group = filtered[start : start + BATCH_SIZE]
 
+            for doc_id, chunk_id, chunk_text_raw in group:
+                chunk_text = clean_ws(chunk_text_raw)
+
+                # If chunk text is empty, we can mark as done with empty extraction
+                # (still does an atomic write, no entities/dates/rels).
                 if not chunk_text:
+                    try:
+                        driver.execute_query(
+                            WRITE_ONE_CHUNK_Q,
+                            doc_id=doc_id,
+                            chunk_id=chunk_id,
+                            significance="",
+                            entities=[],
+                            dates=[],
+                            rels=[],
+                            model=LLM_MODEL,
+                            extracted_at=now_iso(),
+                        )
+                        append_done_chunk(doc_id, chunk_id)
+                        done_local.add(chunk_id)
+                        total_ok += 1
+                        log_info(f"OK (empty) chunk={chunk_id} total_ok={total_ok}")
+                    except Exception as e:
+                        total_write_fail += 1
+                        log_error(f"Neo4j write failed (chunk={chunk_id}): {type(e).__name__}: {e}")
+                        log_error(traceback.format_exc())
                     continue
 
+                # ---- LLM extraction (with retries) ----
                 prompt = build_prompt(chunk_text)
-
                 parsed: Optional[dict] = None
                 last = ""
-                for _ in range(3):  # retry for strict JSON
-                    out = ollama_generate(prompt)
-                    last = out
-                    parsed = extract_json_object(out)
-                    if isinstance(parsed, dict):
-                        break
+
+                try:
+                    for _ in range(3):
+                        out = ollama_generate(prompt)
+                        last = out
+                        parsed = extract_json_object(out)
+                        if isinstance(parsed, dict):
+                            break
+                except Exception as e:
+                    total_llm_fail += 1
+                    log_error(f"LLM call failed (chunk={chunk_id}): {type(e).__name__}: {e}")
+                    # don't mark done; keep going
+                    continue
 
                 if not isinstance(parsed, dict):
-                    print(f"[SKIP] bad JSON for chunk={chunk_id} :: {last[:120]}...")
+                    total_bad_json += 1
+                    log_error(f"Bad JSON (chunk={chunk_id}) :: {last[:250]}...")
+                    # don't mark done; keep going
                     continue
 
                 entities_in = coerce_list(parsed.get("entities"))
-                rels_in = coerce_list(parsed.get("relationships"))
                 dates_in = coerce_list(parsed.get("dates"))
+                rels_in = coerce_list(parsed.get("relationships"))
                 significance = clean_ws(parsed.get("significance"))
 
-                # Build entity rows (deterministic id)
-                entities_out: List[Dict[str, Any]] = []
-                for e in entities_in:
-                    if not isinstance(e, dict):
-                        continue
-                    name = clean_ws(e.get("name"))
-                    if not name:
-                        continue
-                    etype = normalize_entity_type(e.get("type"))
-                    aliases = e.get("aliases")
-                    if not isinstance(aliases, list):
-                        aliases = []
-                    aliases = [clean_ws(a) for a in aliases if clean_ws(a)]
+                # ---- Build deterministic payloads ----
+                entities = build_entities_payload(doc_id, entities_in)
+                dates = build_dates_payload(doc_id, dates_in)
+                rels = build_rels_payload(doc_id, rels_in)
 
-                    # deterministic entity id (doc-scoped)
-                    ent_id = sha16(f"{doc_id}|{etype}|{name.lower()}")
-
-                    evidence = clean_ws(e.get("evidence_excerpt"))  # optional
-                    entities_out.append(
-                        {
-                            "id": ent_id,
-                            "name": name,
-                            "type": etype,
-                            "aliases": aliases,
-                            "evidence_excerpt": evidence,
-                        }
+                # ---- Atomic Neo4j write for this chunk ----
+                try:
+                    driver.execute_query(
+                        WRITE_ONE_CHUNK_Q,
+                        doc_id=doc_id,
+                        chunk_id=chunk_id,
+                        significance=significance,
+                        entities=entities,
+                        dates=dates,
+                        rels=rels,
+                        model=LLM_MODEL,
+                        extracted_at=now_iso(),
                     )
-
-                # Dates: store on chunk as a list of dicts (label/value/certainty)
-                cleaned_dates: List[Dict[str, Any]] = []
-                for d in dates_in:
-                    if not isinstance(d, dict):
-                        continue
-                    label = clean_ws(d.get("label"))
-                    value = clean_ws(d.get("value"))
-                    certainty = clean_ws(d.get("certainty"))
-                    if label or value:
-                        cleaned_dates.append({"label": label, "value": value, "certainty": certainty})
-                if cleaned_dates:
-                    dates_to_write.append({"chunk_id": chunk_id, "dates": cleaned_dates})
-
-                # Relationships: map names -> ids with same rule
-                # If types not given, default to Concept
-                def ent_id_for(name: str, typ: str) -> str:
-                    return sha16(f"{doc_id}|{normalize_entity_type(typ)}|{name.lower()}")
-
-                for r in rels_in:
-                    if not isinstance(r, dict):
-                        continue
-                    s = clean_ws(r.get("source_entity"))
-                    t = clean_ws(r.get("target_entity"))
-                    rel_type = clean_ws(r.get("relation_type")) or "RELATED_TO"
-                    ev = clean_ws(r.get("evidence_excerpt"))
-                    if not s or not t:
-                        continue
-                    s_type = r.get("source_type") or "Concept"
-                    t_type = r.get("target_type") or "Concept"
-                    rels_to_write.append(
-                        {
-                            "source_id": ent_id_for(s, s_type),
-                            "target_id": ent_id_for(t, t_type),
-                            "relation_type": rel_type,
-                            "evidence_excerpt": ev,
-                        }
-                    )
-
-                rows_to_write.append(
-                    {
-                        "doc_id": doc_id,
-                        "chunk_id": chunk_id,
-                        "entities": entities_out,
-                        "significance": significance,
-                    }
-                )
-
-            # Write this group
-            if rows_to_write:
-                driver.execute_query(
-                    write_entities_q,
-                    rows=rows_to_write,
-                    extracted_at=now_iso(),
-                    model=LLM_MODEL,
-                )
-                total += len(rows_to_write)
-                print("Chunks extracted + stored:", total)
-                rows_to_write = []
-
-            if dates_to_write:
-                driver.execute_query(write_dates_q, dates=dates_to_write)
-                dates_to_write = []
-
-            if rels_to_write:
-                driver.execute_query(write_rels_q, rels=rels_to_write)
-                rels_to_write = []
+                    append_done_chunk(doc_id, chunk_id)
+                    done_local.add(chunk_id)
+                    total_ok += 1
+                    log_info(f"OK chunk={chunk_id} entities={len(entities)} dates={len(dates)} rels={len(rels)} total_ok={total_ok}")
+                except Exception as e:
+                    total_write_fail += 1
+                    log_error(f"Neo4j write failed (chunk={chunk_id}): {type(e).__name__}: {e}")
+                    log_error(traceback.format_exc())
+                    # don't mark done; keep going
+                    continue
 
     driver.close()
-    print("Done. Total chunks processed:", total)
+
+    print("Done.")
+    print(f"  OK chunks:                 {total_ok}")
+    print(f"  Locally skipped chunks:    {total_skipped_local}")
+    print(f"  LLM failures:              {total_llm_fail}")
+    print(f"  Bad JSON responses:        {total_bad_json}")
+    print(f"  Neo4j write failures:      {total_write_fail}")
+    print(f"  Progress log:              {PROGRESS_LOG.resolve()}")
 
 
 if __name__ == "__main__":
