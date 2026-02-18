@@ -1,9 +1,9 @@
-# ask.py
+import argparse
 import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 import requests
 
@@ -22,6 +22,15 @@ OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 # ---- Defaults ----
 TOPK_DEFAULT = int(os.getenv("TOPK", "8"))
 MAX_CHARS_PER_CHUNK = int(os.getenv("MAX_CHARS_PER_CHUNK", "2000"))
+
+# ---- Retriever selection ----
+RETRIEVER_DEFAULT = os.getenv("RETRIEVER", "keyword_hybrid").strip() or "keyword_hybrid"
+RETRIEVERS: Dict[str, Callable[..., Dict[str, Any]]] = {
+    "keyword": retrieve_keyword,
+    "entity": retrieve_entity,
+    "hybrid": retrieve_hybrid,
+    "keyword_hybrid": retrieve_keyword_hybrid,
+}
 
 
 def clean_ws(x: Any) -> str:
@@ -54,9 +63,10 @@ def try_read_stdin_json() -> Optional[Dict[str, Any]]:
 
 def pick_chunks(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Your retrievers return {"results": [...] }.
-    Older pipeline may return {"retrieval": {"chunks": [...]}}.
-    Support both (prefer results).
+    Support both:
+      {"results": [...]}
+    and older:
+      {"retrieval": {"chunks": [...]}}
     """
     if not isinstance(data, dict):
         return []
@@ -97,7 +107,6 @@ def build_context(chunks: List[Dict[str, Any]], top_k: int, max_chars_per_chunk:
             header_parts.append(f"Section: {section_title}")
 
         header = " | ".join(header_parts) if header_parts else "Context"
-
         blocks.append(f"{header}\n[chunk_id={cid}]\n{txt}\n")
 
     return "\n".join(blocks).strip()
@@ -125,18 +134,48 @@ ANSWER:
 """
 
 
+def run_retrieval(question: str, retriever_name: str, top_k: int) -> Dict[str, Any]:
+    name = (retriever_name or "").strip()
+    if name not in RETRIEVERS:
+        raise ValueError(f"Unknown retriever '{name}'. Choose from: {', '.join(RETRIEVERS.keys())}")
+
+    retr_fn = RETRIEVERS[name]
+    data = retr_fn(question, top_k=top_k)
+
+    # ensure question is present for downstream
+    if isinstance(data, dict) and not clean_ws(data.get("question")):
+        data["question"] = question
+
+    return data
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--retriever", choices=sorted(RETRIEVERS.keys()), default=RETRIEVER_DEFAULT)
+    p.add_argument("--topk", type=int, default=TOPK_DEFAULT)
+    return p.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+
     data = try_read_stdin_json()
 
     if data is None:
         q = clean_ws(input("Question> "))
-        # default retriever (as you wanted)
-        data = retrieve_keyword_hybrid(q, top_k=TOPK_DEFAULT)
+        data = run_retrieval(q, retriever_name=args.retriever, top_k=int(args.topk))
+    else:
+        # stdin JSON can override retriever/topk if provided
+        q = clean_ws(data.get("question") or data.get("query") or "")
+        retriever = clean_ws(data.get("retriever") or args.retriever)
+        topk = int(data.get("top_k") or data.get("topk") or args.topk or TOPK_DEFAULT)
+        if q:
+            data = run_retrieval(q, retriever_name=retriever, top_k=topk)
 
     question = clean_ws(data.get("question") or data.get("query") or "")
     chunks = pick_chunks(data)
 
-    context = build_context(chunks, top_k=TOPK_DEFAULT, max_chars_per_chunk=MAX_CHARS_PER_CHUNK)
+    context = build_context(chunks, top_k=int(args.topk), max_chars_per_chunk=MAX_CHARS_PER_CHUNK)
     prompt = build_prompt(question, context)
 
     answer = ollama_generate(prompt).strip()
