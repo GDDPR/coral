@@ -1,8 +1,0 @@
-# Copy dump into container
-docker cp ./backups/neo4j_YYYY-MM-DD.dump coral:/tmp/neo4j.dump
-
-# Load it (this overwrites the target DB)
-docker exec -it coral neo4j-admin database load neo4j --from-path=/tmp --overwrite-destination=true
-
-
-
