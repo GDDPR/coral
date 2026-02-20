@@ -1,0 +1,34 @@
+services:
+  neo4j:
+    image: neo4j:latest
+    container_name: coral-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+    volumes:
+      - neo4j_data:/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: coral-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  app:
+    build: .
+    container_name: coral-app
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    depends_on:
+      - neo4j
+      - ollama
+
+volumes:
+  neo4j_data:
+  ollama_data:

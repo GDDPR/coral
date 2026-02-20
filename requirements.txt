@@ -4,3 +4,4 @@ lxml
 neo4j
 ollama
 streamlit
+python-dotenv

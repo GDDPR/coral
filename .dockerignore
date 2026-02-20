@@ -3,5 +3,7 @@ data/
 src/__pycache__/
 src/retrieve/__pycache__/
 src/scrape/__pycache__/
+run_neo4j.sh
+queries.txt
 
 .env
