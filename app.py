@@ -17,7 +17,7 @@ from src.retrieve.retrieve_hybrid import retrieve_hybrid
 from src.retrieve.retrieve_keyword_hybrid import retrieve_keyword_hybrid  # default
 
 # ---- Ollama ----
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:12b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 
@@ -30,7 +30,7 @@ SIBLING_WINDOW = int(os.getenv("SIBLING_WINDOW", "2"))
 DAOD6000_DOC_COUNT = os.getenv("DAOD6000_DOC_COUNT", "___")
 
 # ---- Neo4j (for metadata hydration) ----
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))

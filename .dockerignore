@@ -7,3 +7,6 @@ run_neo4j.sh
 queries.txt
 
 .env
+
+.git/
+.gitignore
