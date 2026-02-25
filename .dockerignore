@@ -6,7 +6,5 @@ src/scrape/__pycache__/
 run_neo4j.sh
 queries.txt
 
-.env
-
 .git/
 .gitignore
