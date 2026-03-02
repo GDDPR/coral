@@ -1,6 +1,17 @@
 import re
 from typing import Any, Dict, List, Optional, Set
 
+###
+from pathlib import Path
+from dotenv import load_dotenv
+ 
+# Find project root dynamically
+BASE_DIR = Path(__file__).resolve().parents[2]
+ 
+# Load .env from root
+load_dotenv(BASE_DIR / ".env")
+###
+
 # Matches:
 #   DAOD 6000-1
 #   DAOD 6000 1

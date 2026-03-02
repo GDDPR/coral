@@ -5,6 +5,17 @@ from typing import Any, Dict, List, Set
 import requests
 from neo4j import GraphDatabase
 
+###
+from pathlib import Path
+from dotenv import load_dotenv
+ 
+# Find project root dynamically
+BASE_DIR = Path(__file__).resolve().parents[2]
+ 
+# Load .env from root
+load_dotenv(BASE_DIR / ".env")
+###
+
 # -------------------------
 # Config (env overrides)
 # -------------------------

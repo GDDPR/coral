@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, List, Callable
 import subprocess
 import sys
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -23,7 +24,7 @@ from src.retrieve.retrieve_keyword_hybrid import retrieve_keyword_hybrid  # defa
 # ---- Ollama ----
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:12b")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 
 # ---- Defaults ----
 TOPK_DEFAULT = int(os.getenv("TOPK", "8"))
@@ -229,8 +230,13 @@ def _run_one_retriever(name: str, user_q: str, clean_query: str, top_k: int) -> 
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.set_page_config(page_title="CORAL Ask", layout="wide")
-st.title("CORAL Ask (Neo4j + Ollama)")
+st.set_page_config(page_title="CORAL-DAOD6000s", layout="wide")
+st.title("CORAL-DAOD6000s")
+st.caption(
+    "Ask questions about the DAOD 6000 series (Information Management). "
+    "Type your question, choose a retriever in the sidebar, then click **Ask**. "
+    "Use **all_retrievers** to compare results. Use **Clear history** to reset your chat list."
+)
 
 # ---- session history init ----
 if "history" not in st.session_state:
@@ -257,7 +263,7 @@ with st.sidebar:
     with colA:
         st.subheader("Your chats")
     with colB:
-        if st.button("Clear history", use_container_width=True):
+        if st.button("Clear history", use_container_width=False):
             st.session_state.history = []
             st.rerun()
 

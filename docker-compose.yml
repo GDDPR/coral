@@ -6,7 +6,8 @@ services:
       - "7474:7474"
       - "7687:7687"
     volumes:
-      - neo4j_data:/data
+      - coral_data:/data
+      - coral_logs:/logs
 
   ollama:
     image: ollama/ollama:latest
@@ -26,8 +27,10 @@ services:
     depends_on:
       - neo4j
       - ollama
-    command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501
 
 volumes:
-  neo4j_data:
+  coral_data:
+    external: true
+  coral_logs:
+    external: true
   ollama_data:

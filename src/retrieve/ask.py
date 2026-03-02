@@ -7,6 +7,17 @@ from typing import Any, Dict, List, Optional, Callable
 
 import requests
 
+###
+from pathlib import Path
+from dotenv import load_dotenv
+ 
+# Find project root dynamically
+BASE_DIR = Path(__file__).resolve().parents[2]
+ 
+# Load .env from root
+load_dotenv(BASE_DIR / ".env")
+###
+
 from retrieve_keyword import retrieve_keyword
 from retrieve_entity import retrieve_entity
 from retrieve_hybrid import retrieve_hybrid
@@ -17,7 +28,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:12b")
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 
 # ---- Defaults ----
 TOPK_DEFAULT = int(os.getenv("TOPK", "8"))
