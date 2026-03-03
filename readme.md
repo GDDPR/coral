@@ -24,115 +24,71 @@ Instead of relying on simple keyword search alone, CORAL uses a graph-aware pipe
 
 ---
 
+## How CORAL works (end-to-end)
+
+### 1) One-time database build (ingestion pipeline)
+This is the “setup” phase. You run it when Neo4j is empty or when you want to rebuild the database.
+
+1. **Scrape DAOD links** and write them to an XML catalog → `catalog.xml`
+2. **Parse the catalog**, keep only **non-cancelled** DAODs, fetch the pages, and **split into Sections**
+   - Output: per-document JSON files in `docs_json/`
+3. **Chunk** the section text into smaller passages
+   - Output: `chunks.jsonl` (backup)
+4. **Load** Document/Section/Chunk into **Neo4j**
+5. **Generate & store embeddings** for chunks using **Ollama embeddings**
+6. **Generate & load entities** using **Ollama LLM**
+
+✅ At the end of this stage, **the Neo4j graph is complete** (documents + sections + chunks + embeddings + entities).
+
+### 2) Asking questions (runtime Q&A flow)
+This is what happens every time a user asks a question in Streamlit (or via CLI).
+
+1. User enters a **question**
+2. User selects a **retrieval mode** (keyword / entity / hybrid / keyword-hybrid)
+3. (Optional) the system rewrites/cleans the question (if enabled)
+4. The retriever queries Neo4j to find the **top-K most relevant chunks**
+5. (Optional) expand chunk hits to **full section context**
+6. Build the LLM input:
+   - assemble the retrieved context
+   - attach **sources/citations** (DAOD + section + link + chunk id, etc.)
+7. Call **Ollama LLM** to generate the final answer
+8. Display:
+   - the answer
+   - the sources/citations used
+
+---
+
+## How the graph works (Neo4j)
+
+### Node types
+CORAL stores policy content and extracted knowledge as nodes:
+
+- **`Document`**: one DAOD document (DAOD number, title, URL, metadata)
+- **`Section`**: a section inside a document (heading + text)
+- **`Chunk`**: a small passage of section text used for retrieval + embeddings
+- **`Entity`**: extracted “things” mentioned in text (roles, orgs, systems, etc.)
+- *(Optional)* **`QAPair`**: distilled question/answer nodes (only if your version enables it)
+
+### Relationships
+CORAL keeps the original hierarchy and links extracted knowledge:
+
+- `(:Document)-[:HAS_SECTION]->(:Section)`
+- `(:Section)-[:CONTAINS]->(:Chunk)`
+- `(:Chunk)-[:MENTIONS]->(:Entity)`
+
+### Why this helps retrieval
+- **Hierarchy** lets you expand from a good chunk to the whole section for context.
+- **Entities** enable entity-aware retrieval and graph-based filtering.
+- **Embeddings on Chunk nodes** enable semantic search (vector retrieval).
+
+---
+
 ## Project Goals
 
 - Build a reusable pipeline for ingesting DND policy documents into a graph database.
 - Support multiple retrieval modes (keyword, vector, entity-based, hybrid).
 - Provide a command-line and web-based interface for asking questions.
 - Demonstrate a practical use case of **GraphDB + LLMs** for enterprise/policy knowledge retrieval.
-
----
-
-## Architecture & Design
-
-### High-Level Architecture
-
-CORAL follows a staged pipeline from source documents to final Q&A:
-
-1. **Indexing / Cataloging**
-2. **Scraping**
-3. **Parsing / Structuring**
-4. **Chunking**
-5. **Entity / QA extraction (optional/enhanced)**
-6. **Embedding generation**
-7. **Neo4j ingestion + retrieval + answer generation**
-
-### Pipeline Stages (1–7)
-
-#### Stage 1 — Indexing / Catalog Building
-A catalog/index of target DAOD pages is built so the pipeline knows which documents to ingest.
-
-**Purpose**
-- Track source URLs
-- Avoid duplicate processing
-- Support reproducible ingestion runs
-
----
-
-#### Stage 2 — Scraping
-The scraper downloads policy pages (and optionally related content) from official sources.
-
-**Purpose**
-- Collect raw HTML/text content
-- Preserve source links and metadata
-- Prepare input for parsing
-
----
-
-#### Stage 3 — Parsing / Document Structuring
-Raw content is parsed into a structured format.
-
-Typical output structure:
-- **Document**
-  - title
-  - DAOD number
-  - source URL
-- **Section**
-  - heading/subheading
-  - section text
-
-**Purpose**
-- Preserve document hierarchy
-- Improve retrieval precision vs flat text blobs
-
----
-
-#### Stage 4 — Chunking
-Section text is split into smaller chunks for embedding and retrieval.
-
-**Why chunking matters**
-- LLMs and vector search perform better on focused passages
-- Reduces irrelevant context in final answers
-- Makes ranking more precise
-
-Typical chunk metadata may include:
-- `chunk_id`
-- `doc_title`
-- `section_title`
-- `chunk_index`
-- `start_char`
-- `text`
-
----
-
-#### Stage 5 — Entity / QA Extraction (Graph Enrichment)
-CORAL can enrich the graph by extracting:
-- **Entities** (people, organizations, roles, systems, etc.)
-- **QAPair** nodes (question-answer style distilled knowledge, if enabled)
-
-**Purpose**
-- Support graph-aware retrieval
-- Improve semantic matching
-- Enable future GraphRAG expansion beyond chunk-only retrieval
-
----
-
-#### Stage 6 — Embedding Generation
-Embeddings are generated for chunks (and optionally QA pairs) using a local embedding model (e.g., Ollama + `nomic-embed-text`).
-
-**Purpose**
-- Enable semantic/vector search
-- Retrieve relevant content even when wording differs
-
----
-
-#### Stage 7 — Neo4j Ingestion, Retrieval, and Answering
-Structured data is loaded into **Neo4j** with constraints and indexes:
-- Uniqueness constraints for key node IDs
-- Full-text index for keyword search
-- Vector indexes for semantic search
-
-Retrievers then query Neo4j and return context to the answer-generation layer.
 
 ---
 
@@ -148,7 +104,7 @@ CORAL supports multiple retrieval strategies (depending on which scripts are ena
 The answer layer then:
 1. receives the user question,
 2. retrieves top relevant chunks,
-3. builds a prompt with context,
+3. builds a prompt with context + sources,
 4. calls the LLM,
 5. returns a grounded answer.
 
@@ -156,151 +112,34 @@ The answer layer then:
 
 ## Python Files (Core Application Components)
 
-> Below is based on the project versions we worked on together. If any filename differs in your current repo, update this section.
+> If any filename differs in your current repo, update this section.
 
 ### Main App / Entry Points
 
 - **`app.py`**  
-  Streamlit UI for interactive question answering.  
-  Lets the user type a question and (in newer versions) choose a retriever mode.
+  Streamlit UI for interactive question answering.
 
 - **`ask.py`**  
-  Command-line Q&A interface.  
-  Takes a question, retrieves relevant chunks, and generates an answer using the configured LLM.
+  Command-line Q&A interface (optional).
 
----
+### Retrieval Modules
+- `retrieve_keyword.py`
+- `retrieve_entity.py`
+- `retrieve_hybrid.py`
+- `retrieve_keyword_hybrid.py`
 
-### Retrieval Modules (examples used in your project)
-
-- **`retrieve_keyword.py`**  
-  Keyword / full-text retrieval against Neo4j.
-
-- **`retrieve_entity.py`**  
-  Entity-aware retrieval using graph nodes/relations.
-
-- **`retrieve_hybrid.py`**  
-  Hybrid retrieval (typically vector + keyword fusion).
-
-- **`retrieve_keyword_hybrid.py`**  
-  Keyword retrieval + HYbrid retrieval
-
-- **`retrieve.py`** *(if present in your current version)*  
-  Wrapper/standalone retrieval entry point (depending on your refactor stage).
-
----
-
-### Query Expansion / Context Utilities (if present)
-
-- **`question_rewrite.py`**  
-  Rewrites user questions to improve retrieval (e.g., clearer keywords/phrasing).
-
-- **`expand_section.py`**  
-  Expands seed chunk results to include surrounding section context when useful.
-
----
-
-### Ingestion / Build Pipeline Scripts (examples, adjust to your repo)
-
-Depending on your current implementation, you may also have scripts for:
-- scraping DAOD pages
-- parsing/structuring documents
-- chunking
-- embedding generation
-- Neo4j loading/upserts
-
-If available, add them here with a one-line description for maintainability.
-
----
-
-## What is a Graph DB? (Aside)
-
-A **Graph Database (GraphDB)** stores data as **nodes** and **relationships** rather than only rows and columns.
-
-### Why use a Graph DB for CORAL?
-
-CORAL is not just storing plain text — it stores structured knowledge such as:
-
-- **Documents**
-- **Sections**
-- **Chunks**
-- **Entities**
-- **QA Pairs** (optional)
-- Relationships between them (e.g., *belongs to*, *mentions*, *derived from*)
-
-This is useful because:
-
-- It preserves document hierarchy (Document → Section → Chunk)
-- It supports richer retrieval (entity and relationship-aware search)
-- It makes future GraphRAG enhancements easier (traversals, reasoning paths, citation paths)
-
-### Example (Conceptual)
-
-- A **Document** node can have many **Section** nodes  
-- Each **Section** can have many **Chunk** nodes  
-- A **Chunk** may mention one or more **Entity** nodes  
-- A **QAPair** may be linked back to the chunk(s) it came from
-
-### Screenshot of Nodes
-> Insert a screenshot from Neo4j Browser / Bloom here showing your node types and relationships.
-
-Suggested caption:
-> *Figure X. Neo4j graph view of CORAL nodes (Document, Section, Chunk, Entity, QAPair) and their relationships.*
-
----
-
-## Data Model (Neo4j)
-
-### Node Types (used / planned)
-
-- `Document`
-- `Section`
-- `Chunk`
-- `Entity`
-- `QAPair`
-- `TableImage` *(if used in your pipeline)*
-
-### Relationships (current CORAL schema)
-
-CORAL preserves document structure and extracted knowledge using graph relationships:
-
-- `(:Document)-[:HAS_SECTION]->(:Section)`
-- `(:Section)-[:CONTAINS]->(:Chunk)`
-- `(:Chunk)-[:MENTIONS]->(:Entity)`
-
----
-
-## Indexes and Constraints (Neo4j)
-
-CORAL uses Neo4j constraints and indexes for both data integrity and retrieval performance.
-
-### Typical Constraints
-- Unique IDs for:
-  - `Document`
-  - `Chunk`
-  - `Entity`
-  - `QAPair`
-  - `TableImage`
-
-### Typical Indexes
-- **Full-text index** for keyword retrieval on document/chunk/question/answer fields
-- **Vector index** on `Chunk.embedding`
-- **Vector index** on `QAPair.embedding` (if enabled)
-
-This enables:
-- fast keyword search,
-- semantic retrieval,
-- and hybrid ranking approaches.
+### Optional utilities
+- `question_rewrite.py`
+- `expand_section.py`
 
 ---
 
 ## Configuration & Deployment Guide
 
 ### Configuration
+CORAL uses environment variables (usually from a `.env` file) for services and model settings.
 
-CORAL uses environment variables (typically from a `.env` file) for services and models.
-
-Example variables (adjust to your current setup):
-
+Example variables:
 - `NEO4J_URI`
 - `NEO4J_USER`
 - `NEO4J_PASSWORD`
@@ -308,5 +147,41 @@ Example variables (adjust to your current setup):
 - `OLLAMA_EMBED_MODEL`
 - `LLM_MODEL`
 - `TOPK`
+- `MAX_CHARS_PER_CHUNK`
+- `VEC_CANDIDATES`
 - `HTTP_TIMEOUT`
 - `OLLAMA_TIMEOUT`
+
+---
+
+## Running CORAL (Docker Compose)
+
+### Prerequisites
+- Docker + Docker Compose installed
+- Ports available:
+  - `8501` (Streamlit)
+  - `7474` + `7687` (Neo4j)
+  - `11434` (Ollama)
+
+### 1) Create a `.env` file
+Create **`.env`** in the repo root:
+
+```bash
+# Neo4j
+NEO4J_URI=bolt://neo4j:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=YOUR_PASSWORD
+
+# Ollama
+OLLAMA_HOST=http://ollama:11434
+OLLAMA_EMBED_MODEL=nomic-embed-text
+LLM_MODEL=gemma3:12b
+
+# Retrieval + prompt sizing
+TOPK=3
+MAX_CHARS_PER_CHUNK=800
+VEC_CANDIDATES=20
+
+# Timeouts
+HTTP_TIMEOUT=180
+OLLAMA_TIMEOUT=180
